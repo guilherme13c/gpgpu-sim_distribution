@@ -174,6 +174,7 @@ class ptx_recognizer;
 %token FTZ_OPTION
 %token NEG_OPTION
 %token SYNC_OPTION
+%token ALIGNED_OPTION
 %token RED_OPTION
 %token ARRIVE_OPTION
 %token ATOMIC_POPC
@@ -254,6 +255,8 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->func_header_info_int(",", $4);
 										recognizer->func_header_info_int(",", $6);
                                                                                 recognizer->maxnt_id($2, $4, $6);}
+	/* Entry register allocation is supplied separately by ptxas resource info. */
+	| MAXNNREG_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnreg", $2); }
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim: Warning: .minnctapersm ignored. \n"); }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim: Warning: .maxnctapersm ignored. \n"); }
 	;
@@ -474,6 +477,7 @@ option: type_spec
 	| wmma_spec 
 	| prmt_spec 
 	| SYNC_OPTION { recognizer->add_option(SYNC_OPTION); }
+	| ALIGNED_OPTION { recognizer->add_option(ALIGNED_OPTION); }
 	| ARRIVE_OPTION { recognizer->add_option(ARRIVE_OPTION); }
 	| RED_OPTION { recognizer->add_option(RED_OPTION); }
 	| UNI_OPTION { recognizer->add_option(UNI_OPTION); }

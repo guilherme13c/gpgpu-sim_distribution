@@ -1526,7 +1526,7 @@ void function_info::ptx_jit_config(
     std::map<unsigned long long, size_t> mallocPtr_Size,
     memory_space *param_mem, gpgpu_t *gpu, dim3 gridDim, dim3 blockDim) {
   static unsigned long long counter = 0;
-  std::vector<std::pair<size_t, unsigned char *> > param_data;
+  std::vector<std::pair<size_t, unsigned char *>> param_data;
   std::vector<unsigned> offsets;
   std::vector<bool> paramIsPointer;
 
@@ -1641,7 +1641,7 @@ void function_info::ptx_jit_config(
   fprintf(fout, "%u,%u,%u %u,%u,%u\n", gridDim.x, gridDim.y, gridDim.z,
           blockDim.x, blockDim.y, blockDim.z);
   size_t index = 0;
-  for (std::vector<std::pair<size_t, unsigned char *> >::const_iterator i =
+  for (std::vector<std::pair<size_t, unsigned char *>>::const_iterator i =
            param_data.begin();
        i != param_data.end(); i++) {
     if (paramIsPointer[index]) {
@@ -1790,6 +1790,15 @@ int tensorcore_op(int inst_opcode) {
   else
     return 0;
 }
+bool ptx_thread_info::predicated_off(const ptx_instruction *pI) {
+  if (!pI->has_pred()) return false;
+  const operand_info &pred = pI->get_pred();
+  ptx_reg_t value = get_operand_value(pred, pred, PRED_TYPE, this, 0);
+  if (pI->get_pred_mod() == -1)
+    return (value.pred & 0x0001) ^ pI->get_pred_neg();
+  return !pred_lookup(pI->get_pred_mod(), value.pred & 0x000F);
+}
+
 void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
   bool skip = false;
   int op_classification = 0;
@@ -1821,16 +1830,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       }
     }
 
-    if (pI->has_pred()) {
-      const operand_info &pred = pI->get_pred();
-      ptx_reg_t pred_value = get_operand_value(pred, pred, PRED_TYPE, this, 0);
-      if (pI->get_pred_mod() == -1) {
-        skip = (pred_value.pred & 0x0001) ^
-               pI->get_pred_neg();  // ptxplus inverts the zero flag
-      } else {
-        skip = !pred_lookup(pI->get_pred_mod(), pred_value.pred & 0x000F);
-      }
-    }
+    skip = predicated_off(pI);
     int inst_opcode = pI->get_opcode();
 
     if (skip) {
@@ -2071,7 +2071,7 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
   static std::map<unsigned, memory_space *> sstarr_memory_lookup;
   static std::map<unsigned, ptx_cta_info *> ptx_cta_lookup;
   static std::map<unsigned, ptx_warp_info *> ptx_warp_lookup;
-  static std::map<unsigned, std::map<unsigned, memory_space *> >
+  static std::map<unsigned, std::map<unsigned, memory_space *>>
       local_memory_lookup;
 
   if (*thread_info != NULL) {

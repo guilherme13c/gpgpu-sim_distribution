@@ -528,6 +528,8 @@ void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
     m_occupied_ctas = 0;
     m_occupied_hwtid.reset();
     m_occupied_cta_to_hwtid.clear();
+    for (unsigned i = 0; i < MAX_CTA_PER_SHADER; ++i)
+      m_cta_registers[i] = cta_register_state();
     m_active_warps = 0;
   }
   for (unsigned i = start_thread; i < end_thread; i++) {
@@ -968,6 +970,7 @@ void shader_core_ctx::fetch() {
         if (m_warp[warp_id]->hardware_done() &&
             !m_scoreboard->pendingWrites(warp_id) &&
             !m_warp[warp_id]->done_exit()) {
+          release_warp_registers(warp_id);
           bool did_exit = false;
           for (unsigned t = 0; t < m_config->warp_size; t++) {
             unsigned tid = warp_id * m_config->warp_size + t;
@@ -1052,6 +1055,99 @@ void exec_shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
   }
 }
 
+bool exec_shader_core_ctx::is_setmaxnreg_predicate_enabled(
+    const warp_inst_t &inst, unsigned warp_id) const {
+  const ptx_instruction &ptx = static_cast<const ptx_instruction &>(inst);
+  if (!ptx.has_pred()) return true;
+  const active_mask_t &active = m_simt_stack[warp_id]->get_active_mask();
+  unsigned executing = 0;
+  for (unsigned lane = 0; lane < m_config->warp_size; ++lane) {
+    if (active.test(lane) &&
+        !m_thread[warp_id * m_config->warp_size + lane]->predicated_off(&ptx))
+      ++executing;
+  }
+  assert((executing == 0 || executing == 32) &&
+         "setmaxnreg predicate must be uniform across a full warp");
+  return executing != 0;
+}
+
+// A successful readiness check does not reserve registers; issue commits it.
+bool shader_core_ctx::can_issue_setmaxnreg(
+    const warp_inst_t &inst, unsigned warp_id,
+    const active_mask_t &active_mask) const {
+  assert(inst.is_setmaxnreg());
+  if (!is_setmaxnreg_predicate_enabled(inst, warp_id)) return true;
+  assert(m_config->warp_size == 32 && active_mask.count() == 32);
+  const shd_warp_t &warp = *m_warp[warp_id];
+  const cta_register_state &cta = m_cta_registers[warp.get_cta_id()];
+  unsigned current = warp.get_registers_per_thread();
+  unsigned target = inst.get_setmaxnreg_target();
+  assert(cta.reserved > 0 && cta.available <= cta.reserved);
+  assert(warp_id >= cta.first_warp);
+  unsigned warp_rank = warp_id - cta.first_warp;
+  unsigned group_id = warp_rank / 4;
+  assert((group_id + 1) * 4 * m_config->warp_size <= cta.thread_count &&
+         "setmaxnreg requires a complete four-warp group");
+  assert(group_id < cta.warpgroups.size());
+  const setmaxnreg_warpgroup_state &group = cta.warpgroups[group_id];
+  assert(
+      (group.issued_mask & (1u << (warp_rank % 4))) == 0 &&
+      "warp reached another setmaxnreg before its peers issued the prior one");
+  assert((group.exited_mask & ~group.issued_mask) == 0 &&
+         "a peer warp exited without executing this setmaxnreg");
+  if (group.issued_mask != 0) {
+    assert(group.pc == inst.pc && "setmaxnreg PC differs within warpgroup");
+    assert(group.action == inst.get_setmaxnreg_action() &&
+           "setmaxnreg action differs within warpgroup");
+    assert(group.target == target &&
+           "setmaxnreg target differs within warpgroup");
+  }
+  if (inst.get_setmaxnreg_action() == inst_t::SETMAXNREG_DEC) {
+    assert(target < current);
+    return true;
+  }
+  assert(target > current);
+  return target * m_config->warp_size - warp.get_allocated_registers() <=
+         cta.available;
+}
+
+void shader_core_ctx::execute_setmaxnreg(const warp_inst_t &inst,
+                                         unsigned warp_id) {
+  shd_warp_t &warp = *m_warp[warp_id];
+  cta_register_state &cta = m_cta_registers[warp.get_cta_id()];
+  unsigned target = inst.get_setmaxnreg_target();
+  cta.available += warp.get_allocated_registers();
+  warp.set_registers_per_thread(target);
+  assert(cta.available >= warp.get_allocated_registers());
+  cta.available -= warp.get_allocated_registers();
+  assert(cta.available <= cta.reserved);
+
+  unsigned warp_rank = warp_id - cta.first_warp;
+  setmaxnreg_warpgroup_state &group = cta.warpgroups[warp_rank / 4];
+  if (group.issued_mask == 0) {
+    group.pc = inst.pc;
+    group.action = inst.get_setmaxnreg_action();
+    group.target = target;
+  }
+  group.issued_mask |= 1u << (warp_rank % 4);
+  // Record participation without delaying any warp at an implicit barrier.
+  if (group.issued_mask == 0xf) group.issued_mask = 0;
+}
+
+void shader_core_ctx::release_warp_registers(unsigned warp_id) {
+  shd_warp_t &warp = *m_warp[warp_id];
+  cta_register_state &cta = m_cta_registers[warp.get_cta_id()];
+  unsigned warp_rank = warp_id - cta.first_warp;
+  setmaxnreg_warpgroup_state &group = cta.warpgroups[warp_rank / 4];
+  unsigned warp_bit = 1u << (warp_rank % 4);
+  assert((group.issued_mask == 0 || (group.issued_mask & warp_bit) != 0) &&
+         "warp exited without executing its warpgroup's setmaxnreg");
+  group.exited_mask |= warp_bit;
+  cta.available += warp.get_allocated_registers();
+  assert(cta.available <= cta.reserved);
+  warp.set_registers_per_thread(0);
+}
+
 void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
                                  const warp_inst_t *next_inst,
                                  const active_mask_t &active_mask,
@@ -1059,6 +1155,12 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   warp_inst_t **pipe_reg =
       pipe_reg_set.get_free(m_config->sub_core_model, sch_id);
   assert(pipe_reg);
+
+  if (next_inst->is_setmaxnreg()) {
+    assert(can_issue_setmaxnreg(*next_inst, warp_id, active_mask));
+    if (is_setmaxnreg_predicate_enabled(*next_inst, warp_id))
+      execute_setmaxnreg(*next_inst, warp_id);
+  }
 
   m_warp[warp_id]->ibuffer_free();
   assert(next_inst->valid());
@@ -1477,8 +1579,8 @@ void scheduler_unit::order_by_priority(
 void scheduler_unit::cycle() {
   SCHED_DPRINTF("scheduler_unit::cycle()\n");
   bool valid_inst =
-      false;  // there was one warp with a valid instruction to issue (didn't
-              // require flush due to control hazard)
+      false;  // there was one warp with a valid instruction to
+              // issue (didn't require flush due to control hazard)
   bool ready_inst = false;   // of the valid instructions, there was one not
                              // waiting for pending register writes
   bool issued_inst = false;  // of these we issued one
@@ -1557,6 +1659,11 @@ void scheduler_unit::cycle() {
 
             const active_mask_t &active_mask =
                 m_shader->get_active_mask(warp_id, pI);
+
+            // Leave a blocked increase at the head of this warp's ibuffer.
+            if (pI->is_setmaxnreg() &&
+                !m_shader->can_issue_setmaxnreg(*pI, warp_id, active_mask))
+              break;
 
             assert(warp(warp_id).inst_in_pipeline());
 

@@ -134,6 +134,7 @@ class shd_warp_t {
     m_last_fetch = 0;
     m_next = 0;
     m_streamID = (unsigned long long)-1;
+    m_registers_per_thread = 0;
 
     // Jin: cdp support
     m_cdp_latency = 0;
@@ -382,6 +383,14 @@ class shd_warp_t {
 
   unsigned long long get_streamID() const { return m_streamID; }
   unsigned get_cta_id() const { return m_cta_id; }
+  unsigned get_registers_per_thread() const { return m_registers_per_thread; }
+  unsigned get_allocated_registers() const {
+    // Match CTA admission's physical allocation granularity.
+    return ((m_registers_per_thread + 3) & ~3) * m_warp_size;
+  }
+  void set_registers_per_thread(unsigned count) {
+    m_registers_per_thread = count;
+  }
 
   unsigned get_dynamic_warp_id() const { return m_dynamic_warp_id; }
   unsigned get_warp_id() const { return m_warp_id; }
@@ -421,6 +430,7 @@ class shd_warp_t {
   unsigned m_warp_id;
   unsigned m_warp_size;
   unsigned m_dynamic_warp_id;
+  unsigned m_registers_per_thread;
 
   address_type m_next_pc;
   unsigned n_completed;  // number of threads in warp completed
@@ -3128,6 +3138,17 @@ class shader_core_ctx : public core_t {
   // Returns true if ready, false if retry needed (sets nanosleep internally)
   bool check_trywait_ready(const warp_inst_t *pI, unsigned warp_id);
 
+  virtual bool is_setmaxnreg_predicate_enabled(const warp_inst_t &inst,
+                                               unsigned warp_id) const {
+    return true;
+  }
+  bool can_issue_setmaxnreg(const warp_inst_t &inst, unsigned warp_id,
+                            const active_mask_t &active_mask) const;
+  void execute_setmaxnreg(const warp_inst_t &inst, unsigned warp_id);
+  void init_cta_registers(unsigned cta_id, unsigned start_thread,
+                          unsigned padded_cta_size, kernel_info_t &kernel);
+  void release_warp_registers(unsigned warp_id);
+
   void create_front_pipeline();
   void create_schedulers();
   void create_exec_pipeline();
@@ -3252,6 +3273,29 @@ class shader_core_ctx : public core_t {
   unsigned int m_occupied_n_threads;
   unsigned int m_occupied_shmem;
   unsigned int m_occupied_regs;
+  struct setmaxnreg_warpgroup_state {
+    setmaxnreg_warpgroup_state()
+        : pc((address_type)-1),
+          action(inst_t::SETMAXNREG_NONE),
+          target(0),
+          issued_mask(0),
+          exited_mask(0) {}
+    address_type pc;
+    inst_t::setmaxnreg_action action;
+    unsigned target;
+    unsigned issued_mask;  // warps that issued the current operation
+    unsigned exited_mask;
+  };
+  struct cta_register_state {
+    cta_register_state()
+        : reserved(0), available(0), first_warp(0), thread_count(0) {}
+    unsigned reserved;   // fixed SM reservation, in 32-bit registers
+    unsigned available;  // registers available to this CTA's warps
+    unsigned first_warp;
+    unsigned thread_count;
+    std::vector<setmaxnreg_warpgroup_state> warpgroups;
+  };
+  cta_register_state m_cta_registers[MAX_CTA_PER_SHADER];
   unsigned int m_occupied_ctas;
   std::bitset<MAX_THREAD_PER_SM> m_occupied_hwtid;
   std::map<unsigned int, unsigned int> m_occupied_cta_to_hwtid;
@@ -3281,6 +3325,8 @@ class exec_shader_core_ctx : public shader_core_ctx {
                                    unsigned num_threads, core_t *core,
                                    unsigned hw_cta_id, unsigned hw_warp_id,
                                    gpgpu_t *gpu);
+  bool is_setmaxnreg_predicate_enabled(const warp_inst_t &inst,
+                                       unsigned warp_id) const override;
   virtual void create_shd_warp();
   virtual const warp_inst_t *get_next_inst(unsigned warp_id, address_type pc);
   virtual void get_pdom_stack_top_info(unsigned warp_id, const warp_inst_t *pI,

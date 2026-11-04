@@ -1250,6 +1250,39 @@ ptx_instruction::ptx_instruction(
   m_atomic_spec = 0;
   m_membar_level = 0;
   m_inst_size = 8;  // bytes
+  if (opcode == SETMAXNREG_OP) {
+    // Decode static metadata; the timing model checks ownership at issue.
+    bool increase = std::count(options.begin(), options.end(), ATOMIC_INC) == 1;
+    bool decrease = std::count(options.begin(), options.end(), ATOMIC_DEC) == 1;
+    bool valid =
+        options.size() == 3 && increase != decrease &&
+        std::count(options.begin(), options.end(), SYNC_OPTION) == 1 &&
+        std::count(options.begin(), options.end(), ALIGNED_OPTION) == 1 &&
+        wmma_options.empty() && scalar_type.size() == 1 &&
+        scalar_type.front() == U32_TYPE && space_spec == undefined_space &&
+        m_operands.size() == 1;
+
+    auto invalid_setmaxnreg = [&]() {
+      fprintf(stderr,
+              "%s:%u: invalid setmaxnreg: expected "
+              "setmaxnreg.{inc|dec}.sync.aligned.u32 "
+              "with an integer constant from 24 to 256, multiple of 8\n",
+              file ? file : "<unknown>", line);
+      abort();
+    };
+
+    if (!valid) invalid_setmaxnreg();
+
+    const operand_info &count = m_operands.front();
+    if (count.get_type() != int_t && count.get_type() != unsigned_t)
+      invalid_setmaxnreg();
+
+    ptx_reg_t value = count.get_literal_value();
+    unsigned long long target =
+        count.get_type() == int_t ? value.s64 : value.u32;
+    if (target < 24 || target > 256 || target % 8 != 0) invalid_setmaxnreg();
+    set_setmaxnreg(increase ? SETMAXNREG_INC : SETMAXNREG_DEC, target);
+  }
   int rr = 0;
   std::list<int>::const_iterator i;
   unsigned n = 1;
@@ -1286,6 +1319,9 @@ ptx_instruction::ptx_instruction(
       case ARRIVE_OPTION:
       case RED_OPTION:
         m_barrier_op = last_ptx_inst_option;
+        break;
+      case ALIGNED_OPTION:
+        assert(opcode == SETMAXNREG_OP);
         break;
       case EQU_OPTION:
       case NEU_OPTION:
@@ -1459,8 +1495,8 @@ ptx_instruction::ptx_instruction(
     const operand_info &op = *i;
     if (op.get_addr_space() != undefined_space)
       m_space_spec =
-          op.get_addr_space();  // TODO: can have more than one memory space for
-                                // ptxplus (g8x) inst
+          op.get_addr_space();  // TODO: can have more than one memory
+                                // space for ptxplus (g8x) inst
   }
   if (opcode == TEX_OP) m_space_spec = tex_space;
 

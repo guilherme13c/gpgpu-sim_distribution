@@ -2015,6 +2015,33 @@ bool shader_core_ctx::occupy_shader_resource_1block(kernel_info_t &k,
   return true;
 }
 
+void shader_core_ctx::init_cta_registers(unsigned cta_id, unsigned start_thread,
+                                         unsigned padded_cta_size,
+                                         kernel_info_t &kernel) {
+  cta_register_state &cta = m_cta_registers[cta_id];
+  assert(cta.reserved == 0 && cta.available == 0 && cta.warpgroups.empty());
+  const struct gpgpu_ptx_sim_info *info = ptx_sim_kernel_info(kernel.entry());
+  assert(info != NULL && info->regs >= 0);
+  // regs comes from ptxas resource usage (or the trace's CUDA NUM_REGS).
+  // Preserve that logical limit; rounding applies only to physical allocation.
+  unsigned registers_per_thread = info->regs;
+  cta.reserved = padded_cta_size * ((registers_per_thread + 3) & ~3);
+  cta.available = 0;
+  unsigned start_warp = start_thread / m_config->warp_size;
+  unsigned warp_count = padded_cta_size / m_config->warp_size;
+  cta.first_warp = start_warp;
+  cta.thread_count = kernel.threads_per_cta();
+  assert(start_thread % m_config->warp_size == 0);
+  assert(padded_cta_size ==
+         ((cta.thread_count + m_config->warp_size - 1) / m_config->warp_size) *
+             m_config->warp_size);
+  cta.warpgroups.resize((warp_count + 3) / 4);
+  for (unsigned i = start_warp; i < start_warp + warp_count; ++i) {
+    assert(m_warp[i]->get_cta_id() == cta_id);
+    m_warp[i]->set_registers_per_thread(registers_per_thread);
+  }
+}
+
 void shader_core_ctx::release_shader_resource_1block(unsigned hw_ctaid,
                                                      kernel_info_t &k) {
   if (m_config->gpgpu_concurrent_kernel_sm) {
@@ -2047,6 +2074,12 @@ void shader_core_ctx::release_shader_resource_1block(unsigned hw_ctaid,
     assert(m_occupied_ctas >= 1);
     m_occupied_ctas--;
   }
+  assert(m_cta_registers[hw_ctaid].available ==
+         m_cta_registers[hw_ctaid].reserved);
+  for (const auto &group : m_cta_registers[hw_ctaid].warpgroups)
+    assert(group.issued_mask == 0 &&
+           "incomplete setmaxnreg warpgroup at CTA exit");
+  m_cta_registers[hw_ctaid] = cta_register_state();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2170,6 +2203,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
 
   // initialize the SIMT stacks and fetch hardware
   init_warps(free_cta_hw_id, start_thread, end_thread, ctaid, cta_size, kernel);
+  init_cta_registers(free_cta_hw_id, start_thread, padded_cta_size, kernel);
   m_n_active_cta++;
 
   shader_CTA_count_log(m_sid, 1);

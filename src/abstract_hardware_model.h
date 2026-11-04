@@ -1287,6 +1287,8 @@ struct dram_callback_t {
 
 class inst_t {
  public:
+  enum setmaxnreg_action { SETMAXNREG_NONE, SETMAXNREG_INC, SETMAXNREG_DEC };
+
   inst_t() {
     m_decoded = false;
     pc = (address_type)-1;
@@ -1318,6 +1320,8 @@ class inst_t {
     isize = 0;
     m_is_proxy_fence = false;
     m_syncs_op = SYNCS_MAX_ENUM_NO_USED;
+    m_setmaxnreg_action = SETMAXNREG_NONE;
+    m_setmaxnreg_target = 0;
   }
   bool valid() const { return m_decoded; }
   virtual void print_insn(FILE *fp) const {
@@ -1348,6 +1352,19 @@ class inst_t {
             (sp_op == TENSOR__OP));
   }
   bool is_alu() const { return (sp_op == INT__OP); }
+  bool is_setmaxnreg() const { return m_setmaxnreg_action != SETMAXNREG_NONE; }
+  setmaxnreg_action get_setmaxnreg_action() const {
+    return m_setmaxnreg_action;
+  }
+  unsigned get_setmaxnreg_target() const { return m_setmaxnreg_target; }
+  // Decode operands here; validate direction against warp ownership at issue.
+  void set_setmaxnreg(setmaxnreg_action action, unsigned target) {
+    assert(action == SETMAXNREG_INC || action == SETMAXNREG_DEC);
+    assert(target >= 24 && target <= 256 && target % 8 == 0);
+    m_setmaxnreg_action = action;
+    m_setmaxnreg_target = target;
+  }
+
   bool is_fence() const { return (op == FENCE_OP); }
   bool is_syncs() const { return (op == SYNCS_OP); }
   bool is_shmem_load() const {
@@ -1455,6 +1472,9 @@ class inst_t {
   // Weili: syncs unit related, for mbarrier
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier
   syncs_op m_syncs_op;
+
+  setmaxnreg_action m_setmaxnreg_action;
+  unsigned m_setmaxnreg_target;  // absolute register count per thread
 };
 
 enum divergence_support_t { POST_DOMINATOR = 1, NUM_SIMD_MODEL };
