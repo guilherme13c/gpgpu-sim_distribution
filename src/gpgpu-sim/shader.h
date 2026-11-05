@@ -3144,7 +3144,7 @@ class shader_core_ctx : public core_t {
   }
   bool can_issue_setmaxnreg(const warp_inst_t &inst, unsigned warp_id,
                             const active_mask_t &active_mask) const;
-  void execute_setmaxnreg(const warp_inst_t &inst, unsigned warp_id);
+  void execute_setmaxnreg(warp_inst_t &inst, unsigned warp_id);
   void init_cta_registers(unsigned cta_id, unsigned start_thread,
                           unsigned padded_cta_size, kernel_info_t &kernel);
   void release_warp_registers(unsigned warp_id);

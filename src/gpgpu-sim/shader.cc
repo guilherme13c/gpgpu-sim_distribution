@@ -1076,51 +1076,67 @@ bool shader_core_ctx::can_issue_setmaxnreg(
     const warp_inst_t &inst, unsigned warp_id,
     const active_mask_t &active_mask) const {
   assert(inst.is_setmaxnreg());
-  if (!is_setmaxnreg_predicate_enabled(inst, warp_id)) return true;
+  if (active_mask.none() || !is_setmaxnreg_predicate_enabled(inst, warp_id))
+    return true;
   assert(m_config->warp_size == 32 && active_mask.count() == 32);
   const shd_warp_t &warp = *m_warp[warp_id];
   const cta_register_state &cta = m_cta_registers[warp.get_cta_id()];
   unsigned current = warp.get_registers_per_thread();
   unsigned target = inst.get_setmaxnreg_target();
   assert(cta.reserved > 0 && cta.available <= cta.reserved);
-  assert(warp_id >= cta.first_warp);
-  unsigned warp_rank = warp_id - cta.first_warp;
-  unsigned group_id = warp_rank / 4;
-  assert((group_id + 1) * 4 * m_config->warp_size <= cta.thread_count &&
-         "setmaxnreg requires a complete four-warp group");
-  assert(group_id < cta.warpgroups.size());
-  const setmaxnreg_warpgroup_state &group = cta.warpgroups[group_id];
-  assert(
-      (group.issued_mask & (1u << (warp_rank % 4))) == 0 &&
-      "warp reached another setmaxnreg before its peers issued the prior one");
-  assert((group.exited_mask & ~group.issued_mask) == 0 &&
-         "a peer warp exited without executing this setmaxnreg");
-  if (group.issued_mask != 0) {
-    assert(group.pc == inst.pc && "setmaxnreg PC differs within warpgroup");
-    assert(group.action == inst.get_setmaxnreg_action() &&
-           "setmaxnreg action differs within warpgroup");
-    assert(group.target == target &&
-           "setmaxnreg target differs within warpgroup");
+  // PTX requires aligned four-warp participation. Raw SASS attempts are
+  // per-warp operations and must not advance or inherit the PTX tracker.
+  if (inst.get_setmaxnreg_semantics() == inst_t::SETMAXNREG_PTX_SYNC_ALIGNED) {
+    assert(warp_id >= cta.first_warp);
+    unsigned warp_rank = warp_id - cta.first_warp;
+    unsigned group_id = warp_rank / 4;
+    assert((group_id + 1) * 4 * m_config->warp_size <= cta.thread_count &&
+           "setmaxnreg requires a complete four-warp group");
+    assert(group_id < cta.warpgroups.size());
+    const setmaxnreg_warpgroup_state &group = cta.warpgroups[group_id];
+    assert((group.issued_mask & (1u << (warp_rank % 4))) == 0 &&
+           "warp reached another setmaxnreg before its peers issued the prior "
+           "one");
+    assert((group.exited_mask & ~group.issued_mask) == 0 &&
+           "a peer warp exited without executing this setmaxnreg");
+    if (group.issued_mask != 0) {
+      assert(group.pc == inst.pc && "setmaxnreg PC differs within warpgroup");
+      assert(group.action == inst.get_setmaxnreg_action() &&
+             "setmaxnreg action differs within warpgroup");
+      assert(group.target == target &&
+             "setmaxnreg target differs within warpgroup");
+    }
   }
   if (inst.get_setmaxnreg_action() == inst_t::SETMAXNREG_DEC) {
     assert(target < current);
     return true;
   }
   assert(target > current);
+  if (inst.is_setmaxnreg_try_alloc()) return true;
   return target * m_config->warp_size - warp.get_allocated_registers() <=
          cta.available;
 }
 
-void shader_core_ctx::execute_setmaxnreg(const warp_inst_t &inst,
-                                         unsigned warp_id) {
+void shader_core_ctx::execute_setmaxnreg(warp_inst_t &inst, unsigned warp_id) {
   shd_warp_t &warp = *m_warp[warp_id];
   cta_register_state &cta = m_cta_registers[warp.get_cta_id()];
   unsigned target = inst.get_setmaxnreg_target();
-  cta.available += warp.get_allocated_registers();
+  unsigned old_allocation = warp.get_allocated_registers();
+  unsigned new_allocation = target * m_config->warp_size;
+  // Recheck at commit: readiness does not reserve registers, and another
+  // scheduler may already have consumed this CTA's available registers.
+  if (new_allocation > old_allocation &&
+      new_allocation - old_allocation > cta.available) {
+    assert(inst.is_setmaxnreg_try_alloc());
+    inst.set_setmaxnreg_result(warp_inst_t::SETMAXNREG_FAILED);
+    return;
+  }
+  cta.available = cta.available + old_allocation - new_allocation;
   warp.set_registers_per_thread(target);
-  assert(cta.available >= warp.get_allocated_registers());
-  cta.available -= warp.get_allocated_registers();
   assert(cta.available <= cta.reserved);
+  inst.set_setmaxnreg_result(warp_inst_t::SETMAXNREG_SUCCEEDED);
+  if (inst.get_setmaxnreg_semantics() != inst_t::SETMAXNREG_PTX_SYNC_ALIGNED)
+    return;
 
   unsigned warp_rank = warp_id - cta.first_warp;
   setmaxnreg_warpgroup_state &group = cta.warpgroups[warp_rank / 4];
@@ -1156,10 +1172,13 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       pipe_reg_set.get_free(m_config->sub_core_model, sch_id);
   assert(pipe_reg);
 
+  // Native PTX predicate lookup needs the original ptx_instruction, before
+  // copying it into the pipeline's warp_inst_t.
+  bool setmaxnreg_enabled = false;
   if (next_inst->is_setmaxnreg()) {
     assert(can_issue_setmaxnreg(*next_inst, warp_id, active_mask));
-    if (is_setmaxnreg_predicate_enabled(*next_inst, warp_id))
-      execute_setmaxnreg(*next_inst, warp_id);
+    setmaxnreg_enabled = active_mask.any() &&
+                         is_setmaxnreg_predicate_enabled(*next_inst, warp_id);
   }
 
   m_warp[warp_id]->ibuffer_free();
@@ -1170,6 +1189,13 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       m_warp[warp_id]->get_dynamic_warp_id(), sch_id,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
+  if (next_inst->is_setmaxnreg()) {
+    if (setmaxnreg_enabled)
+      execute_setmaxnreg(**pipe_reg, warp_id);
+    else
+      (*pipe_reg)->set_setmaxnreg_result(warp_inst_t::SETMAXNREG_SKIPPED);
+  }
+  // The frontend observes the result on the issued copy, including failures.
   func_exec_inst(**pipe_reg);
 
   // Add LDGSTS instructions into a buffer

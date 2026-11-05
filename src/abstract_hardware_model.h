@@ -1288,6 +1288,10 @@ struct dram_callback_t {
 class inst_t {
  public:
   enum setmaxnreg_action { SETMAXNREG_NONE, SETMAXNREG_INC, SETMAXNREG_DEC };
+  enum setmaxnreg_semantics {
+    SETMAXNREG_PTX_SYNC_ALIGNED,
+    SETMAXNREG_SASS_CTAPOOL
+  };
 
   inst_t() {
     m_decoded = false;
@@ -1322,6 +1326,7 @@ class inst_t {
     m_syncs_op = SYNCS_MAX_ENUM_NO_USED;
     m_setmaxnreg_action = SETMAXNREG_NONE;
     m_setmaxnreg_target = 0;
+    m_setmaxnreg_semantics = SETMAXNREG_PTX_SYNC_ALIGNED;
   }
   bool valid() const { return m_decoded; }
   virtual void print_insn(FILE *fp) const {
@@ -1357,12 +1362,24 @@ class inst_t {
     return m_setmaxnreg_action;
   }
   unsigned get_setmaxnreg_target() const { return m_setmaxnreg_target; }
+  setmaxnreg_semantics get_setmaxnreg_semantics() const {
+    return m_setmaxnreg_semantics;
+  }
+  bool is_setmaxnreg_try_alloc() const {
+    return m_setmaxnreg_action == SETMAXNREG_INC &&
+           m_setmaxnreg_semantics == SETMAXNREG_SASS_CTAPOOL;
+  }
   // Decode operands here; validate direction against warp ownership at issue.
-  void set_setmaxnreg(setmaxnreg_action action, unsigned target) {
+  void set_setmaxnreg(
+      setmaxnreg_action action, unsigned target,
+      setmaxnreg_semantics semantics = SETMAXNREG_PTX_SYNC_ALIGNED) {
     assert(action == SETMAXNREG_INC || action == SETMAXNREG_DEC);
     assert(target >= 24 && target <= 256 && target % 8 == 0);
+    assert(semantics == SETMAXNREG_PTX_SYNC_ALIGNED ||
+           semantics == SETMAXNREG_SASS_CTAPOOL);
     m_setmaxnreg_action = action;
     m_setmaxnreg_target = target;
+    m_setmaxnreg_semantics = semantics;
   }
 
   bool is_fence() const { return (op == FENCE_OP); }
@@ -1475,6 +1492,7 @@ class inst_t {
 
   setmaxnreg_action m_setmaxnreg_action;
   unsigned m_setmaxnreg_target;  // absolute register count per thread
+  setmaxnreg_semantics m_setmaxnreg_semantics;
 };
 
 enum divergence_support_t { POST_DOMINATOR = 1, NUM_SIMD_MODEL };
@@ -1485,8 +1503,16 @@ class warp_inst_t : public inst_t {
   // TODO Weili Oct, 8 2025: Fields unique to certain type of instructions
   // TODO should be grouped under a union to reduce memory usage
  public:
+  enum setmaxnreg_result {
+    SETMAXNREG_NOT_EXECUTED,
+    SETMAXNREG_SKIPPED,
+    SETMAXNREG_FAILED,
+    SETMAXNREG_SUCCEEDED
+  };
+
   // constructors
   warp_inst_t() {
+    m_setmaxnreg_result = SETMAXNREG_NOT_EXECUTED;
     m_uid = 0;
     m_streamID = (unsigned long long)-1;
     m_empty = true;
@@ -1511,6 +1537,7 @@ class warp_inst_t : public inst_t {
     memset(m_ldgsts_arrives_mbar_addr, 0, sizeof(m_ldgsts_arrives_mbar_addr));
   }
   warp_inst_t(const core_config *config) {
+    m_setmaxnreg_result = SETMAXNREG_NOT_EXECUTED;
     m_uid = 0;
     m_streamID = (unsigned long long)-1;
     assert(config->warp_size <= MAX_WARP_SIZE);
@@ -1547,6 +1574,14 @@ class warp_inst_t : public inst_t {
     memset(m_ldgsts_arrives_mbar_addr, 0, sizeof(m_ldgsts_arrives_mbar_addr));
   }
   virtual ~warp_inst_t() {}
+
+  // Result belongs to this issued instruction, not its decoded source.
+  setmaxnreg_result get_setmaxnreg_result() const {
+    return m_setmaxnreg_result;
+  }
+  void set_setmaxnreg_result(setmaxnreg_result result) {
+    m_setmaxnreg_result = result;
+  }
 
   // modifiers
   void broadcast_barrier_reduction(const active_mask_t &access_mask);
@@ -1743,6 +1778,7 @@ class warp_inst_t : public inst_t {
   }
 
  protected:
+  setmaxnreg_result m_setmaxnreg_result;
   unsigned m_uid;
   unsigned long long m_streamID;
   bool m_empty;
