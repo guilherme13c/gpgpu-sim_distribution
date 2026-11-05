@@ -1106,6 +1106,9 @@ bool shader_core_ctx::can_issue_setmaxnreg(
       assert(group.target == target &&
              "setmaxnreg target differs within warpgroup");
     }
+    // An equal PTX target needs no capacity but still issues and records
+    // warpgroup participation.
+    if (target == current) return true;
   }
   if (inst.get_setmaxnreg_action() == inst_t::SETMAXNREG_DEC) {
     assert(target < current);
